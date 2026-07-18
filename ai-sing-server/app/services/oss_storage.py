@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+import logging
+import secrets
+import time
+from urllib.parse import quote, urlparse
+
+import requests
+
+from app.core.config import Settings, get_settings
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OssObject:
+    object_key: str
+    public_url: str
+
+
+class OssStorageError(RuntimeError):
+    pass
+
+
+class OssStorageService:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            self.settings.oss_enabled
+            and self.settings.oss_bucket
+            and self.settings.oss_endpoint
+            and self.settings.oss_access_key_id
+            and self.settings.oss_access_key_secret
+        )
+
+    def presign_upload(
+        self,
+        category: str,
+        filename: str,
+        content_type: str,
+        owner_id: int | str | None = None,
+    ) -> dict:
+        self._require_enabled()
+        object_key = self.build_object_key(category, filename, owner_id)
+        headers = {"Content-Type": content_type or "application/octet-stream"}
+        upload_url = self._bucket(self.settings.oss_endpoint).sign_url(
+            "PUT",
+            object_key,
+            self.settings.oss_upload_expire_seconds,
+            headers=headers,
+        )
+        return {
+            "object_key": object_key,
+            "upload_url": upload_url,
+            "public_url": self.public_url(object_key),
+            "headers": headers,
+            "expires_in": self.settings.oss_upload_expire_seconds,
+        }
+
+    def upload_file(self, path: str | Path, category: str, owner_id: int | str | None = None) -> OssObject:
+        self._require_enabled()
+        source = Path(path)
+        if not source.is_file():
+            raise FileNotFoundError(f"OSS upload source missing: {source}")
+        object_key = self.build_object_key(category, source.name, owner_id)
+        logger.info("Uploading file to OSS via public endpoint object_key=%s source=%s", object_key, source)
+        self._bucket(self.settings.oss_endpoint).put_object_from_file(
+            object_key,
+            str(source),
+        )
+        logger.info("Uploaded file to OSS object_key=%s bytes=%s", object_key, source.stat().st_size)
+        return OssObject(object_key=object_key, public_url=self.public_url(object_key))
+
+    def download_to_file(self, object_key_or_url: str, target: str | Path) -> Path:
+        target_path = Path(target)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if object_key_or_url.startswith(("http://", "https://")):
+            logger.info("Downloading OSS object via public URL source=%s target=%s", object_key_or_url, target_path)
+            response = requests.get(object_key_or_url, timeout=120)
+            response.raise_for_status()
+            target_path.write_bytes(response.content)
+            logger.info("Downloaded OSS object via public URL target=%s bytes=%s", target_path, target_path.stat().st_size)
+            return target_path
+        object_key = self.object_key_from_url(object_key_or_url)
+        if self.enabled and object_key:
+            logger.info("Downloading OSS object via bucket object_key=%s target=%s", object_key, target_path)
+            self._bucket(self.settings.oss_endpoint).get_object_to_file(
+                object_key,
+                str(target_path),
+            )
+            logger.info("Downloaded OSS object via bucket target=%s bytes=%s", target_path, target_path.stat().st_size)
+            return target_path
+        response = requests.get(object_key_or_url, timeout=120)
+        response.raise_for_status()
+        target_path.write_bytes(response.content)
+        return target_path
+
+    def build_object_key(self, category: str, filename: str, owner_id: int | str | None = None) -> str:
+        safe_category = self._safe_path_part(category)
+        safe_name = Path(filename or "upload.bin").name
+        suffix = Path(safe_name).suffix
+        date_prefix = datetime.now(UTC).strftime("%Y/%m/%d")
+        owner_part = self._safe_path_part(str(owner_id)) if owner_id is not None else "public"
+        prefix = self.settings.oss_key_prefix.strip("/")
+        generated_name = f"{int(time.time() * 1000)}-{secrets.token_hex(6)}{suffix}"
+        return f"{prefix}/{safe_category}/{owner_part}/{date_prefix}/{generated_name}"
+
+    def public_url(self, object_key: str) -> str:
+        if self.settings.oss_public_base_url:
+            return f"{self.settings.oss_public_base_url.rstrip('/')}/{quote(object_key, safe='/')}"
+        endpoint = self.settings.oss_endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+        return f"https://{self.settings.oss_bucket}.{endpoint}/{quote(object_key, safe='/')}"
+
+    def object_key_from_url(self, object_key_or_url: str) -> str:
+        if not object_key_or_url.startswith(("http://", "https://")):
+            return object_key_or_url
+        public_base = self.settings.oss_public_base_url.rstrip("/")
+        if public_base and object_key_or_url.startswith(public_base + "/"):
+            return object_key_or_url[len(public_base) + 1 :]
+        parsed = urlparse(object_key_or_url)
+        return parsed.path.lstrip("/")
+
+    def _bucket(self, endpoint: str):
+        import oss2
+
+        auth = oss2.Auth(self.settings.oss_access_key_id, self.settings.oss_access_key_secret)
+        return oss2.Bucket(auth, endpoint, self.settings.oss_bucket)
+
+    def _require_enabled(self) -> None:
+        if not self.enabled:
+            raise OssStorageError("OSS is not configured. Please set AIS_OSS_* environment variables.")
+
+    def _safe_path_part(self, value: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value.strip())
+        return cleaned.strip("-") or "default"
